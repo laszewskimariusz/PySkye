@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.env
+
+# LLM model files
+models/
+*.ggml.bin
+
+# PySkye config and cache
+.pyskye/
+
+# Egg metadata
+*.egg-info/
+\# Development artifacts
+.mypy_cache/

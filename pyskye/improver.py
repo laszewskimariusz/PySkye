@@ -2,20 +2,73 @@ import os
 import sys
 import importlib
 from typing import List, Optional
-
-import openai
+from llama_cpp import Llama
 from git import Repo
-
 from pyskye.loader import load_project
 from pyskye.analyzer import analyze_files
 
 
-# Wymagamy ChatCompletion – jeśli go nie ma, prosimy o upgrade
-if not hasattr(openai, "ChatCompletion"):
-    raise ImportError(
-        "Your openai package is outdated. "
-        "Please run 'pip install --upgrade openai'."
-    )
+def get_local_llm() -> Llama:
+    """
+    Initialize a local LLM using llama-cpp-python.
+    Priority:
+      1. LLAMA_MODEL_PATH env var
+      2. .pyskye/config.json
+      3. ~/models/llama-2-7b.ggml.bin
+    Prompts and saves if unset.
+    """
+    # 1. Environment variable
+    model_path = os.getenv("LLAMA_MODEL_PATH")
+
+    # 2. Config file
+    cfg_dir = os.path.join(os.getcwd(), ".pyskye")
+    cfg_file = os.path.join(cfg_dir, "config.json")
+    if not model_path and os.path.isfile(cfg_file):
+        try:
+            import json
+            cfg = json.load(open(cfg_file))
+            model_path = cfg.get("model_path")
+        except Exception:
+            pass
+
+    # 3. Default location
+    if not model_path:
+        default = os.path.expanduser(
+            "~/models/llama-2-7b.ggml.bin"
+        )
+        if os.path.isfile(default):
+            model_path = default
+
+    # 4. Prompt if still unset
+    if not model_path:
+        raw = input("Enter the Llama model path or export command: ").strip()
+        # Extract path after '=' if present
+        if '=' in raw:
+            raw = raw.rsplit('=', 1)[1]
+        # Remove any leading or trailing quotes
+        raw = raw.strip('"\'')
+        expanded = os.path.expanduser(raw)
+        if not expanded or not os.path.isfile(expanded):
+            raise RuntimeError(
+                f"Model path does not exist: {expanded}"
+            )
+        model_path = expanded
+        # Save to config
+        os.makedirs(cfg_dir, exist_ok=True)
+        try:
+            import json
+            with open(cfg_file, "w") as f:
+                json.dump({"model_path": model_path}, f, indent=2)
+            print(f"Saved model path to {cfg_file}")
+        except Exception as e:
+            print(f"Warning: could not write config: {e}")
+
+    # Final expansion
+    model_path = os.path.expanduser(model_path)
+    return Llama(
+        model_path=model_path,
+        n_threads=os.cpu_count(),
+    )(model_path=model_path, n_threads=os.cpu_count())
 
 
 def path_to_module(path: str, base_path: str) -> str:
@@ -23,38 +76,25 @@ def path_to_module(path: str, base_path: str) -> str:
     return rel.replace(os.sep, ".")[:-3]
 
 
-def generate_patch(
-    target_files: List[str], prompt: str
-) -> str:
+def generate_patch(target_files: List[str], prompt: str) -> str:
     """
-    Use OpenAI to generate a unified diff for specific files.
+    Generate unified diff via local LLM.
     """
+    llm = get_local_llm()
     files_list = ", ".join(target_files)
-    content = (
-        f"Target files: {files_list}\n"
+    full_prompt = (
+        "You are an AI assistant generating unified diffs.\n"
+        f"Files: {files_list}\n"
         f"Request: {prompt}\n"
-        "Generate a unified diff for only these files."
+        "Output diff only."
     )
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a code-fixing AI that returns diffs "
-                    "for requested files only."
-                ),
-            },
-            {"role": "user", "content": content},
-        ],
-    )
-    return response.choices[0].message.content
+    resp = llm(full_prompt, max_tokens=2048, stop=["```"], temperature=0.0)
+    choices = resp.get("choices", [])
+    text = choices[0].get("text", "") if choices else ""
+    return text.strip()
 
 
 def apply_patch(patch: str, repo_path: str) -> None:
-    """
-    Apply a unified diff to the repo via git apply.
-    """
     repo = Repo(repo_path)
     try:
         repo.git.apply("--whitespace=fix", input=patch)
@@ -63,29 +103,19 @@ def apply_patch(patch: str, repo_path: str) -> None:
         print(f"Failed to apply patch: {e}")
 
 
-def reload_changed_modules(
-    changed_files: List[str], base_path: str
-) -> None:
-    """
-    Reload only the modified modules without restarting.
-    """
+def reload_changed_modules(changed_files: List[str], base_path: str) -> None:
     for path in changed_files:
-        mod = path_to_module(path, base_path)
-        if mod in sys.modules:
-            importlib.reload(sys.modules[mod])
-            print(f"Reloaded module: {mod}")
+        module = path_to_module(path, base_path)
+        if module in sys.modules:
+            importlib.reload(sys.modules[module])
+            print(f"Reloaded module: {module}")
 
 
 def select_file(files: List[str]) -> Optional[List[str]]:
-    """
-    Let the user pick one file or 'all'; returns list or None.
-    """
     print("Available files:")
-    for idx, f in enumerate(files, 1):
-        print(f"  {idx}. {f}")
-    choice = input(
-        "Select number (or 'all', 'exit'): "
-    ).strip().lower()
+    for i, f in enumerate(files, 1):
+        print(f"  {i}. {f}")
+    choice = input("Select file number or 'all'/'exit': ").strip().lower()
     if choice in ("exit", "quit"):
         return None
     if choice == "all":
@@ -93,16 +123,12 @@ def select_file(files: List[str]) -> Optional[List[str]]:
     if choice.isdigit():
         i = int(choice)
         if 1 <= i <= len(files):
-            return [files[i - 1]]
+            return [files[i-1]]
     print("Invalid selection, try again.")
     return select_file(files)
 
 
 def interactive_improve(path: str) -> None:
-    """
-    Loop: select files, describe change, generate+apply patch,
-    reload modules and re-run analysis on updated files.
-    """
     print(f"Starting interactive improvement in '{path}'")
     files = load_project(path)
 
@@ -111,42 +137,29 @@ def interactive_improve(path: str) -> None:
         if target is None:
             print("Exiting improvement session.")
             break
-
-        prompt = input("Describe the change or feature: ").strip()
+        prompt = input("Describe change or feature: ").strip()
         if not prompt:
             print("Prompt cannot be empty.")
             continue
-
         print(f"Generating patch for: {', '.join(target)}...")
         patch = generate_patch(target, prompt)
-        if not patch.strip():
-            print("No patch received. Refine your prompt.")
+        if not patch:
+            print("No patch received; refine prompt.")
             continue
-
         print("Applying patch...")
         apply_patch(patch, path)
-
         print("Reloading changed modules...")
         reload_changed_modules(target, path)
-
-        print(
-            "Re-running static analysis on updated files...\n"
-        )
+        print("Re-running static analysis...\n")
         issues = analyze_files(target)
         if issues:
-            print("Issues found in updated files:")
+            print("Issues in updated files:")
             for issue in issues:
                 print(issue)
-            print(
-                "Refine prompt, select another file, "
-                "or type 'exit'."
-            )
+            print("Refine prompt or select another file, or 'exit'.")
         else:
-            print("No issues found!")
-            cont = input(
-                "Apply another improvement? (y/n): "
-            ).strip().lower()
-            if cont not in ("y", "yes"):
+            print("No issues found in updated files!")
+            cont = input("Apply another improvement? (yes/no): ").strip().lower()
+            if cont not in ('yes', 'y'):
                 print("Exiting improvement session.")
                 break
-
