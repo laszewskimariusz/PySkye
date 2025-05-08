@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: pyskye
+Version: 0.1.0
+Summary: Self-improving AI code analyzer for Apple Silicon
+Author: Mariusz Laszewski
+Requires-Dist: openai
+Requires-Dist: llama-cpp-python
+Requires-Dist: gitpython
+Requires-Dist: requests
+Requires-Dist: flake8
+Requires-Dist: mypy
+Dynamic: author
+Dynamic: requires-dist
+Dynamic: summary

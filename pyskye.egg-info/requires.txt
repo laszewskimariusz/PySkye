@@ -1,0 +1,6 @@
+openai
+llama-cpp-python
+gitpython
+requests
+flake8
+mypy
